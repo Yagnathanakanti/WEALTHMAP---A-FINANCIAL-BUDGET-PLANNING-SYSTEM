@@ -1,0 +1,363 @@
+"""
+tests/test_edge_cases.py
+=========================
+Edge case and boundary tests for all WealthMap functions.
+Covers: zero values, extreme values, type boundaries, and adversarial inputs
+that real users are likely to accidentally or intentionally enter.
+"""
+
+import pytest
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import (
+    calculate_savings,
+    emi_ratio,
+    savings_rate,
+    financial_risk_classification,
+    risk_label,
+    goal_feasibility,
+    health_score_weighted,
+    investment_recommendation,
+    predict_savings_lr,
+    build_lr_model,
+)
+
+
+# ===========================================================================
+# calculate_savings — edge cases
+# ===========================================================================
+class TestCalculateSavingsEdgeCases:
+
+    def test_all_zeros(self):
+        assert calculate_savings(0, 0, 0) == 0
+
+    def test_negative_does_not_occur_with_clamp(self):
+        """Even if expenses far exceed salary, savings can't go negative."""
+        result = calculate_savings(1_000, 500_000, 200_000)
+        assert result == 0
+
+    def test_very_large_salary(self):
+        """Crore-level salary (₹1 Cr/mo) should compute without overflow."""
+        result = calculate_savings(10_000_000, 3_000_000, 1_000_000)
+        assert result == 6_000_000
+
+    def test_very_small_amounts(self):
+        """Minimal amounts like a daily-wage earner."""
+        result = calculate_savings(600, 400, 100)
+        assert result == 100
+
+    def test_float_precision_edge(self):
+        """Floating-point arithmetic should not produce negative results."""
+        result = calculate_savings(100.01, 50.01, 50.01)
+        assert result >= 0
+
+    def test_emi_alone_exceeds_salary(self):
+        """EMI > salary with zero expenses → still clamped to 0."""
+        result = calculate_savings(30_000, 0, 35_000)
+        assert result == 0
+
+
+# ===========================================================================
+# emi_ratio — edge cases
+# ===========================================================================
+class TestEmiRatioEdgeCases:
+
+    def test_zero_emi_zero_salary(self):
+        """Both zero → return 0, not NaN or error."""
+        assert emi_ratio(0, 0) == pytest.approx(0.0)
+
+    def test_emi_greater_than_salary(self):
+        """Logically possible (user took on too much debt)."""
+        ratio = emi_ratio(80_000, 50_000)
+        assert ratio == pytest.approx(160.0)
+
+    def test_very_small_emi(self):
+        """₹1 EMI on ₹100k salary → essentially zero."""
+        ratio = emi_ratio(1, 100_000)
+        assert ratio == pytest.approx(0.001)
+
+    def test_very_large_values(self):
+        ratio = emi_ratio(1_000_000, 5_000_000)
+        assert ratio == pytest.approx(20.0)
+
+
+# ===========================================================================
+# savings_rate — edge cases
+# ===========================================================================
+class TestSavingsRateEdgeCases:
+
+    def test_savings_exceeds_salary(self):
+        """Logically impossible in normal flow but must not crash."""
+        rate = savings_rate(120_000, 100_000)
+        assert rate == pytest.approx(120.0)
+
+    def test_both_zero(self):
+        assert savings_rate(0, 0) == pytest.approx(0.0)
+
+    def test_tiny_savings_large_salary(self):
+        rate = savings_rate(1, 10_000_000)
+        assert rate == pytest.approx(0.00001)
+
+    def test_very_high_rate(self):
+        rate = savings_rate(90_000, 100_000)
+        assert rate == pytest.approx(90.0)
+
+
+# ===========================================================================
+# financial_risk_classification — edge cases
+# ===========================================================================
+class TestRiskClassificationEdgeCases:
+
+    def test_all_zero_inputs(self):
+        """Zero savings, zero EMI, no emergency fund."""
+        score = financial_risk_classification(0, 0, 0)
+        assert isinstance(score, int)
+        assert score >= 0
+
+    def test_savings_exactly_at_20_percent(self):
+        """Boundary: exactly 20% savings → takes the middle branch (≥10)."""
+        score_20 = financial_risk_classification(20.0, 30.0, 0)
+        score_25 = financial_risk_classification(25.0, 30.0, 0)
+        assert score_25 > score_20     # 25% → top branch → higher score
+
+    def test_emi_exactly_at_30_percent(self):
+        """EMI exactly 30% → safe branch (≤30)."""
+        score_30 = financial_risk_classification(15.0, 30.0, 0)
+        score_31 = financial_risk_classification(15.0, 31.0, 0)
+        assert score_30 > score_31
+
+    def test_emi_exactly_at_50_percent(self):
+        """EMI exactly 50% → still medium branch (≤50)."""
+        score_50 = financial_risk_classification(15.0, 50.0, 0)
+        score_51 = financial_risk_classification(15.0, 51.0, 0)
+        assert score_50 > score_51
+
+    def test_emergency_months_exactly_at_3(self):
+        """3 months → partial bonus of 15."""
+        score_3 = financial_risk_classification(15.0, 35.0, 3)
+        score_2 = financial_risk_classification(15.0, 35.0, 2)
+        assert score_3 > score_2
+
+    def test_emergency_months_exactly_at_6(self):
+        """6 months → full bonus of 25."""
+        score_6 = financial_risk_classification(15.0, 35.0, 6)
+        score_5 = financial_risk_classification(15.0, 35.0, 5)
+        assert score_6 > score_5
+
+    def test_extreme_high_emi_low_savings(self):
+        """100% EMI, 0% savings → worst score possible."""
+        score = financial_risk_classification(0, 100, 0)
+        assert score < 40
+
+    def test_savings_above_20_gets_top_branch(self):
+        score = financial_risk_classification(21.0, 30.0, 6)
+        assert score == 100   # 40 + 35 + 25 = 100
+
+
+# ===========================================================================
+# risk_label — edge cases
+# ===========================================================================
+class TestRiskLabelEdgeCases:
+
+    def test_negative_score_handled(self):
+        """Negative score (shouldn't happen but must not crash)."""
+        label, css = risk_label(-10)
+        assert label == "High"
+
+    def test_score_above_100(self):
+        """Score over 100 shouldn't crash — treated as Low."""
+        label, css = risk_label(150)
+        assert label == "Low"
+
+    @pytest.mark.parametrize("score", [0, 1, 10, 39])
+    def test_high_risk_range(self, score):
+        label, _ = risk_label(score)
+        assert label == "High"
+
+    @pytest.mark.parametrize("score", [40, 50, 60, 69])
+    def test_medium_risk_range(self, score):
+        label, _ = risk_label(score)
+        assert label == "Medium"
+
+    @pytest.mark.parametrize("score", [70, 80, 90, 100])
+    def test_low_risk_range(self, score):
+        label, _ = risk_label(score)
+        assert label == "Low"
+
+
+# ===========================================================================
+# goal_feasibility — edge cases
+# ===========================================================================
+class TestGoalFeasibilityEdgeCases:
+
+    def test_zero_months(self):
+        """Zero months → required = 0 (avoids divide-by-zero)."""
+        feas, req, gap, sav = goal_feasibility(80_000, 40_000, 10_000, 100_000, 0)
+        assert req == 0.0
+
+    def test_zero_target_zero_months(self):
+        """Both zero → should not raise."""
+        feas, req, gap, sav = goal_feasibility(80_000, 40_000, 10_000, 0, 0)
+        assert feas == pytest.approx(0.0)
+
+    def test_very_long_timeframe(self):
+        """10-year plan (120 months) should accumulate very large amount."""
+        feas, _, _, sav = goal_feasibility(80_000, 40_000, 10_000, 1_000_000, 120)
+        # 30k × 120 = 36L >> 10L → easily > 100%
+        assert feas > 100
+
+    def test_very_large_target(self):
+        """₹10 Cr target is infeasible for average salary."""
+        feas, _, _, _ = goal_feasibility(80_000, 40_000, 10_000, 100_000_000, 24)
+        assert feas < 5.0
+
+    def test_negative_gap_means_surplus(self):
+        """When savings > required, gap is negative (surplus)."""
+        _, req, gap, sav = goal_feasibility(80_000, 40_000, 10_000, 100_000, 12)
+        # req = 100k/12 ≈ 8.3k; sav = 30k → big surplus
+        assert gap < 0
+
+    def test_feasibility_proportional_to_timeframe(self):
+        """Doubling the timeframe should roughly double feasibility."""
+        _, _, _, sav = goal_feasibility(80_000, 40_000, 10_000, 500_000, 12)
+        feas_12, _, _, _ = goal_feasibility(80_000, 40_000, 10_000, 500_000, 12)
+        feas_24, _, _, _ = goal_feasibility(80_000, 40_000, 10_000, 500_000, 24)
+        assert feas_24 > feas_12
+
+
+# ===========================================================================
+# health_score_weighted — edge cases
+# ===========================================================================
+class TestHealthScoreEdgeCases:
+
+    def test_output_always_integer(self):
+        for sr, er, gf in [(0, 0, 0), (30, 0, 100), (15, 30, 50), (5, 70, 10)]:
+            score = health_score_weighted(sr, er, gf)
+            assert isinstance(score, int)
+
+    def test_score_never_negative(self):
+        score = health_score_weighted(0, 100, 0)
+        assert score >= 0
+
+    def test_score_never_exceeds_100(self):
+        score = health_score_weighted(100, 0, 200)
+        assert score <= 100
+
+    def test_emi_100_percent_kills_emi_component(self):
+        """100% EMI → emi score component = 0."""
+        score_no_emi = health_score_weighted(20, 0, 0)
+        score_max_emi = health_score_weighted(20, 100, 0)
+        assert score_no_emi > score_max_emi
+
+    @pytest.mark.parametrize("sr,er,gf", [
+        (0.0,   0.0,   0.0),
+        (30.0,  0.0, 100.0),
+        (10.0, 30.0,  50.0),
+        (5.0,  80.0,   0.0),
+        (25.0, 25.0,  75.0),
+    ])
+    def test_parametric_score_bounds(self, sr, er, gf):
+        score = health_score_weighted(sr, er, gf)
+        assert 0 <= score <= 100
+
+
+# ===========================================================================
+# investment_recommendation — edge cases
+# ===========================================================================
+class TestInvestmentRecommendationEdgeCases:
+
+    def test_score_zero(self):
+        """Extreme low score → safe instruments."""
+        recs = investment_recommendation(0, 0.0, 100.0)
+        assert len(recs) > 0
+
+    def test_score_100(self):
+        """Perfect score → growth instruments."""
+        recs = investment_recommendation(100, 35.0, 10.0)
+        assert len(recs) > 0
+
+    def test_all_allocations_are_numeric_strings(self):
+        """Allocation must be parseable as a float after stripping %."""
+        for score in [10, 55, 85]:
+            recs = investment_recommendation(score, 20.0, 25.0)
+            for _, alloc, _, _ in recs:
+                val = float(alloc.replace("%", ""))
+                assert val > 0
+
+    def test_rationale_is_non_empty_string(self):
+        recs = investment_recommendation(70, 22.0, 18.0)
+        for _, _, rationale, _ in recs:
+            assert isinstance(rationale, str)
+            assert len(rationale) > 0
+
+    def test_tag_is_non_empty_string(self):
+        recs = investment_recommendation(30, 5.0, 60.0)
+        for _, _, _, tag in recs:
+            assert isinstance(tag, str)
+            assert len(tag) > 0
+
+
+# ===========================================================================
+# predict_savings_lr — edge cases
+# ===========================================================================
+class TestPredictSavingsLrEdgeCases:
+
+    def test_output_length_matches_months(self):
+        for years in [1, 2, 5, 7]:
+            preds = predict_savings_lr(20_000, 8.0, years)
+            assert len(preds) == years * 12
+
+    def test_no_negative_predictions(self):
+        """Model output is clamped at 0."""
+        preds = predict_savings_lr(0, 0, years=3)
+        assert all(v >= 0 for v in preds)
+
+    def test_zero_savings_input(self):
+        """Zero starting savings should not crash; may produce near-zero output."""
+        preds = predict_savings_lr(0, 5.0, years=2)
+        assert len(preds) == 24
+
+    def test_very_high_growth_rate(self):
+        """25% growth rate (maximum slider) should return reasonable values."""
+        preds = predict_savings_lr(50_000, 25.0, years=5)
+        assert all(isinstance(v, float) for v in preds)
+        assert all(v >= 0 for v in preds)
+
+    def test_zero_growth_rate(self):
+        preds = predict_savings_lr(30_000, 0.0, years=3)
+        assert len(preds) == 36
+        assert all(v >= 0 for v in preds)
+
+    def test_single_year_projection(self):
+        preds = predict_savings_lr(25_000, 8.0, years=1)
+        assert len(preds) == 12
+
+    def test_seven_year_max_projection(self):
+        preds = predict_savings_lr(25_000, 8.0, years=7)
+        assert len(preds) == 84
+
+
+# ===========================================================================
+# build_lr_model — edge cases
+# ===========================================================================
+class TestBuildLrModelEdgeCases:
+
+    def test_model_is_fitted(self):
+        """Model should have coef_ attribute after fitting."""
+        model = build_lr_model()
+        assert hasattr(model, "coef_")
+        assert len(model.coef_) == 3   # three features
+
+    def test_model_intercept_exists(self):
+        model = build_lr_model()
+        assert hasattr(model, "intercept_")
+
+    def test_model_prediction_is_scalar(self):
+        import numpy as np
+        model = build_lr_model()
+        X     = np.array([[12, 8.0, 30_000]])
+        pred  = model.predict(X)
+        assert pred.shape == (1,)

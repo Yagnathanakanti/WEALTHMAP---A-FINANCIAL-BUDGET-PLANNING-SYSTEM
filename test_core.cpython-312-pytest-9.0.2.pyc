@@ -1,0 +1,379 @@
+"""
+tests/test_core.py
+==================
+Unit tests for all pure business-logic functions in app.py.
+Each function is tested in isolation with realistic Indian financial values.
+"""
+
+import pytest
+import sys
+import os
+
+# ---------------------------------------------------------------------------
+# Import the functions directly from app.py (Streamlit guards are bypassed
+# because we never call st.* functions — only the pure helpers).
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import (
+    calculate_savings,
+    emi_ratio,
+    savings_rate,
+    financial_risk_classification,
+    risk_label,
+    goal_feasibility,
+    health_score_weighted,
+    investment_recommendation,
+)
+
+
+# ===========================================================================
+# calculate_savings
+# ===========================================================================
+class TestCalculateSavings:
+
+    def test_normal_case(self):
+        """Standard salaried employee: 80k salary, 40k expenses, 15k EMI."""
+        assert calculate_savings(80_000, 40_000, 15_000) == 25_000
+
+    def test_zero_expenses_and_emi(self):
+        """All income is surplus when there are no obligations."""
+        assert calculate_savings(50_000, 0, 0) == 50_000
+
+    def test_expenses_exceed_salary(self):
+        """Savings must never go negative."""
+        assert calculate_savings(30_000, 35_000, 0) == 0
+
+    def test_emi_wipes_out_remaining(self):
+        """Combined expenses + EMI > salary → clamp to zero."""
+        assert calculate_savings(50_000, 30_000, 25_000) == 0
+
+    def test_exact_breakeven(self):
+        """salary == expenses + emi → exactly zero savings."""
+        assert calculate_savings(60_000, 40_000, 20_000) == 0
+
+    def test_high_income_professional(self):
+        """Senior engineer: 2L salary, 70k expenses, 30k EMI."""
+        assert calculate_savings(200_000, 70_000, 30_000) == 100_000
+
+    def test_zero_salary(self):
+        """No income → no savings (even with zero expenses)."""
+        assert calculate_savings(0, 0, 0) == 0
+
+    def test_fractional_values(self):
+        """Float inputs should work correctly."""
+        result = calculate_savings(75_500.50, 30_200.25, 10_100.25)
+        assert result == pytest.approx(35_200.00, abs=0.01)
+
+
+# ===========================================================================
+# emi_ratio
+# ===========================================================================
+class TestEmiRatio:
+
+    def test_typical_ratio(self):
+        """30k EMI on 100k salary = 30%."""
+        assert emi_ratio(30_000, 100_000) == pytest.approx(30.0)
+
+    def test_zero_emi(self):
+        """No EMI → 0% burden."""
+        assert emi_ratio(0, 80_000) == pytest.approx(0.0)
+
+    def test_zero_salary_guard(self):
+        """Division by zero must return 0, not raise."""
+        assert emi_ratio(10_000, 0) == pytest.approx(0.0)
+
+    def test_full_salary_as_emi(self):
+        """100% EMI-to-income (extreme debt)."""
+        assert emi_ratio(50_000, 50_000) == pytest.approx(100.0)
+
+    def test_healthy_threshold(self):
+        """20k EMI on 80k salary is 25% — below the 30% safe ceiling."""
+        ratio = emi_ratio(20_000, 80_000)
+        assert ratio == pytest.approx(25.0)
+        assert ratio < 30.0
+
+    def test_danger_zone(self):
+        """EMI > 50% of income crosses the danger threshold."""
+        ratio = emi_ratio(55_000, 100_000)
+        assert ratio == pytest.approx(55.0)
+        assert ratio > 50.0
+
+
+# ===========================================================================
+# savings_rate
+# ===========================================================================
+class TestSavingsRate:
+
+    def test_twenty_percent_benchmark(self):
+        """20k savings on 100k salary = exactly 20%."""
+        assert savings_rate(20_000, 100_000) == pytest.approx(20.0)
+
+    def test_zero_savings(self):
+        """Zero savings → 0% rate."""
+        assert savings_rate(0, 80_000) == pytest.approx(0.0)
+
+    def test_zero_salary_guard(self):
+        """Division-by-zero guard must return 0."""
+        assert savings_rate(10_000, 0) == pytest.approx(0.0)
+
+    def test_high_saver(self):
+        """50% savings rate (early-retirement path)."""
+        assert savings_rate(50_000, 100_000) == pytest.approx(50.0)
+
+    def test_low_saver(self):
+        """5% savings rate is below the critical 10% threshold."""
+        rate = savings_rate(4_000, 80_000)
+        assert rate == pytest.approx(5.0)
+        assert rate < 10.0
+
+
+# ===========================================================================
+# financial_risk_classification
+# ===========================================================================
+class TestFinancialRiskClassification:
+
+    def test_low_risk_profile(self):
+        """Healthy savings (25%), low EMI (20%), 6-month emergency fund."""
+        score = financial_risk_classification(25.0, 20.0, 6)
+        assert score >= 70  # Low risk threshold
+
+    def test_medium_risk_profile(self):
+        """Moderate savings (15%), borderline EMI (35%), 3-month buffer."""
+        score = financial_risk_classification(15.0, 35.0, 3)
+        assert 40 <= score < 70
+
+    def test_high_risk_profile(self):
+        """Minimal savings (5%), excessive EMI (55%), no emergency fund."""
+        score = financial_risk_classification(5.0, 55.0, 0)
+        assert score < 40
+
+    def test_score_is_non_negative(self):
+        """Score must never be negative regardless of inputs."""
+        score = financial_risk_classification(0, 100, 0)
+        assert score >= 0
+
+    def test_max_score_ceiling(self):
+        """Best-case profile: 30%+ savings, ≤30% EMI, 6+ months emergency."""
+        score = financial_risk_classification(35.0, 15.0, 9)
+        assert score == 100  # 40 + 35 + 25 = 100
+
+    def test_emergency_fund_bonus(self):
+        """Adding a 6-month fund boosts score by 25 vs 0-month baseline."""
+        score_no_fund   = financial_risk_classification(15.0, 35.0, 0)
+        score_with_fund = financial_risk_classification(15.0, 35.0, 6)
+        assert score_with_fund - score_no_fund == 25
+
+    def test_partial_emergency_fund(self):
+        """3-month fund gives +15, not +25."""
+        score_3m = financial_risk_classification(15.0, 35.0, 3)
+        score_0m = financial_risk_classification(15.0, 35.0, 0)
+        assert score_3m - score_0m == 15
+
+
+# ===========================================================================
+# risk_label
+# ===========================================================================
+class TestRiskLabel:
+
+    def test_low_risk(self):
+        label, css = risk_label(80)
+        assert label == "Low"
+        assert css == "risk-low"
+
+    def test_medium_risk(self):
+        label, css = risk_label(55)
+        assert label == "Medium"
+        assert css == "risk-medium"
+
+    def test_high_risk(self):
+        label, css = risk_label(20)
+        assert label == "High"
+        assert css == "risk-high"
+
+    def test_boundary_low(self):
+        """Score of exactly 70 is Low risk."""
+        label, _ = risk_label(70)
+        assert label == "Low"
+
+    def test_boundary_medium(self):
+        """Score of exactly 40 is Medium risk."""
+        label, _ = risk_label(40)
+        assert label == "Medium"
+
+    def test_boundary_high(self):
+        """Score of 39 is High risk."""
+        label, _ = risk_label(39)
+        assert label == "High"
+
+    def test_score_zero(self):
+        label, css = risk_label(0)
+        assert label == "High"
+        assert css == "risk-high"
+
+    def test_score_hundred(self):
+        label, css = risk_label(100)
+        assert label == "Low"
+        assert css == "risk-low"
+
+
+# ===========================================================================
+# goal_feasibility
+# ===========================================================================
+class TestGoalFeasibility:
+
+    def setup_method(self):
+        """Common financials: 80k salary, 40k expenses, 10k EMI → 30k/mo savings."""
+        self.salary   = 80_000
+        self.expenses = 40_000
+        self.emi      = 10_000
+
+    def test_fully_feasible_goal(self):
+        """Target of 3L in 12 months with 30k/mo savings → 120% feasibility."""
+        feas, req, gap, sav = goal_feasibility(
+            self.salary, self.expenses, self.emi, 300_000, 12
+        )
+        assert feas == pytest.approx(120.0)
+        assert sav  == 30_000
+        assert req  == pytest.approx(25_000.0)
+        assert gap  < 0  # surplus, so gap is negative
+
+    def test_partially_feasible_goal(self):
+        """Target of 6L in 12 months with 30k/mo savings → 60% feasibility."""
+        feas, req, gap, sav = goal_feasibility(
+            self.salary, self.expenses, self.emi, 600_000, 12
+        )
+        assert feas == pytest.approx(60.0)
+        assert gap  > 0  # shortfall
+
+    def test_infeasible_goal(self):
+        """Ambitious target of 20L in 12 months → very low feasibility."""
+        feas, req, gap, sav = goal_feasibility(
+            self.salary, self.expenses, self.emi, 2_000_000, 12
+        )
+        assert feas < 30.0
+        assert gap  > 0
+
+    def test_zero_target(self):
+        """Zero target → 0% feasibility (no divide-by-zero error)."""
+        feas, req, gap, sav = goal_feasibility(
+            self.salary, self.expenses, self.emi, 0, 12
+        )
+        assert feas == pytest.approx(0.0)
+
+    def test_no_savings_available(self):
+        """When expenses + EMI >= salary, all metrics are zero."""
+        feas, req, gap, sav = goal_feasibility(80_000, 70_000, 15_000, 100_000, 12)
+        assert sav  == 0
+        assert feas == pytest.approx(0.0)
+
+    def test_required_monthly_calculation(self):
+        """Required monthly = target / months."""
+        _, req, _, _ = goal_feasibility(
+            self.salary, self.expenses, self.emi, 360_000, 12
+        )
+        assert req == pytest.approx(30_000.0)
+
+    def test_gap_equals_required_minus_savings(self):
+        """gap = required_monthly - monthly_savings."""
+        _, req, gap, sav = goal_feasibility(
+            self.salary, self.expenses, self.emi, 600_000, 12
+        )
+        assert gap == pytest.approx(req - sav)
+
+
+# ===========================================================================
+# health_score_weighted
+# ===========================================================================
+class TestHealthScoreWeighted:
+
+    def test_perfect_health(self):
+        """30% savings, 0% EMI, 100% goal feasibility → max score."""
+        score = health_score_weighted(30.0, 0.0, 100.0)
+        assert score == 100
+
+    def test_score_clamped_at_100(self):
+        """Even extreme positive inputs should not exceed 100."""
+        score = health_score_weighted(60.0, 0.0, 200.0)
+        assert score <= 100
+
+    def test_zero_savings_zero_goal(self):
+        """
+        Zero savings and zero goal feasibility, but zero EMI.
+        Zero EMI means EMI component is fully healthy (max 40 pts),
+        so score = 0 (savings) + 40 (EMI) + 0 (goal) = 40.
+        """
+        score = health_score_weighted(0.0, 0.0, 0.0)
+        assert score == 40  # EMI=0% → max EMI score of 40 pts
+
+    def test_high_emi_penalises_score(self):
+        """High EMI (60%) should produce a very low score."""
+        score = health_score_weighted(10.0, 60.0, 0.0)
+        assert score < 30
+
+    def test_good_savings_good_score(self):
+        """25% savings, 25% EMI, no goal → reasonable score."""
+        score = health_score_weighted(25.0, 25.0, 0.0)
+        assert 40 <= score <= 80
+
+    def test_goal_feasibility_contributes(self):
+        """Adding 100% goal feasibility should raise the score."""
+        base   = health_score_weighted(20.0, 30.0, 0.0)
+        with_g = health_score_weighted(20.0, 30.0, 100.0)
+        assert with_g > base
+        assert with_g - base == 20  # max goal contribution is 20 pts
+
+
+# ===========================================================================
+# investment_recommendation
+# ===========================================================================
+class TestInvestmentRecommendation:
+
+    def test_low_risk_returns_growth_instruments(self):
+        """High risk score → equity-heavy recommendations."""
+        recs = investment_recommendation(80, 25.0, 20.0)
+        names = [r[0] for r in recs]
+        assert any("Equity" in n or "Index" in n for n in names)
+
+    def test_medium_risk_returns_balanced_instruments(self):
+        """Medium risk score → balanced allocation."""
+        recs = investment_recommendation(55, 15.0, 35.0)
+        names = [r[0] for r in recs]
+        assert any("Balanced" in n or "Bond" in n or "Gold" in n for n in names)
+
+    def test_high_risk_returns_safe_instruments(self):
+        """Low risk score → capital-safe instruments."""
+        recs = investment_recommendation(20, 5.0, 55.0)
+        names = [r[0] for r in recs]
+        assert any("FD" in n or "Fixed" in n or "Government" in n for n in names)
+
+    def test_returns_list(self):
+        """Output must always be a non-empty list."""
+        for score in [10, 55, 85]:
+            recs = investment_recommendation(score, 15.0, 30.0)
+            assert isinstance(recs, list)
+            assert len(recs) > 0
+
+    def test_each_recommendation_has_four_fields(self):
+        """Each recommendation tuple must have exactly 4 elements."""
+        recs = investment_recommendation(70, 20.0, 25.0)
+        for rec in recs:
+            assert len(rec) == 4
+
+    def test_allocation_ends_with_percent(self):
+        """Allocation field must be a percentage string like '60%'."""
+        recs = investment_recommendation(70, 20.0, 25.0)
+        for _, allocation, _, _ in recs:
+            assert allocation.endswith("%")
+
+    def test_boundary_score_70(self):
+        """Score of exactly 70 → Low risk path (growth instruments)."""
+        recs = investment_recommendation(70, 22.0, 18.0)
+        names = [r[0] for r in recs]
+        assert any("Equity" in n or "Index" in n for n in names)
+
+    def test_boundary_score_40(self):
+        """Score of exactly 40 → Medium risk path."""
+        recs = investment_recommendation(40, 12.0, 38.0)
+        names = [r[0] for r in recs]
+        assert any("Balanced" in n or "Bond" in n for n in names)

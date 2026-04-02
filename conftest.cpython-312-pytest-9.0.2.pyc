@@ -1,0 +1,99 @@
+"""
+tests/conftest.py
+==================
+Shared pytest configuration and fixtures for the WealthMap test suite.
+Handles Streamlit import side-effects so tests can import app.py cleanly.
+"""
+
+import sys
+import types
+import os
+
+# ---------------------------------------------------------------------------
+# Mock streamlit before any test module imports app.py.
+# This prevents st.set_page_config() and other st.* calls from crashing
+# outside a Streamlit server context.
+# ---------------------------------------------------------------------------
+
+def _make_streamlit_mock():
+    st = types.ModuleType("streamlit")
+
+    # State dict backing session_state
+    _state = {}
+
+    class _SessionState(dict):
+        def __getattr__(self, key):
+            try:
+                return self[key]
+            except KeyError:
+                raise AttributeError(key)
+        def __setattr__(self, key, value):
+            self[key] = value
+
+    st.session_state = _SessionState()
+
+    # No-op stubs for every st.* call used in app.py
+    _noop = lambda *a, **kw: None
+    for name in [
+        "set_page_config", "markdown", "columns", "metric", "radio",
+        "number_input", "text_input", "selectbox", "slider", "button",
+        "plotly_chart", "warning", "write", "sidebar", "expander",
+        "header", "subheader", "title", "info", "success", "error",
+    ]:
+        setattr(st, name, _noop)
+
+    # columns() must return a list of context managers
+    class _Col:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def metric(self, *a, **kw): pass
+        def number_input(self, *a, **kw): return 0
+        def text_input(self, *a, **kw): return ""
+        def selectbox(self, *a, **kw): return ""
+        def plotly_chart(self, *a, **kw): pass
+        def markdown(self, *a, **kw): pass
+        def slider(self, *a, **kw): return 0
+
+    st.columns = lambda *a, **kw: [_Col() for _ in range(a[0] if a else 1)]
+
+    # sidebar as a context manager
+    class _Sidebar:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def __getattr__(self, _): return _noop
+        markdown = _noop
+        radio    = lambda *a, **kw: ""
+
+    st.sidebar = _Sidebar()
+
+    return st
+
+
+sys.modules.setdefault("streamlit", _make_streamlit_mock())
+
+# ---------------------------------------------------------------------------
+# Shared pytest fixtures available to all test modules
+# ---------------------------------------------------------------------------
+import pytest
+
+
+@pytest.fixture(scope="session")
+def lr_model():
+    """Return the singleton LR model (built once per test session)."""
+    from app import _LR_MODEL
+    return _LR_MODEL
+
+
+@pytest.fixture
+def healthy_profile():
+    return {"salary": 100_000, "expenses": 45_000, "emi": 15_000, "emergency_months": 6}
+
+
+@pytest.fixture
+def average_profile():
+    return {"salary": 60_000, "expenses": 32_000, "emi": 15_000, "emergency_months": 3}
+
+
+@pytest.fixture
+def stressed_profile():
+    return {"salary": 40_000, "expenses": 25_000, "emi": 20_000, "emergency_months": 0}

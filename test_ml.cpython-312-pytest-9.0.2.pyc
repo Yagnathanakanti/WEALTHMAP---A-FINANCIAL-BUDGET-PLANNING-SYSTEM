@@ -1,0 +1,341 @@
+"""
+tests/test_ml.py
+=================
+ML Verification & Validation tests for the Linear Regression Savings Predictor.
+
+Covers:
+  - Model structure & training validation
+  - Prediction correctness and monotonicity
+  - Feature sensitivity analysis
+  - Statistical consistency (R², residuals)
+  - Reproducibility & determinism
+  - Numerical stability
+"""
+
+import pytest
+import numpy as np
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import (
+    build_lr_model,
+    predict_savings_lr,
+    _LR_MODEL,
+)
+
+
+# ===========================================================================
+# Model structure & training validation
+# ===========================================================================
+class TestModelStructure:
+
+    def test_model_has_three_features(self):
+        """LR model was trained on [month, growth_rate, previous_savings]."""
+        model = build_lr_model()
+        assert model.coef_.shape == (3,)
+
+    def test_model_coefs_are_finite(self):
+        """No NaN or infinite coefficients after training."""
+        model = build_lr_model()
+        assert np.all(np.isfinite(model.coef_))
+        assert np.isfinite(model.intercept_)
+
+    def test_singleton_model_is_fitted(self):
+        """The module-level _LR_MODEL must be ready to predict."""
+        assert hasattr(_LR_MODEL, "coef_")
+        assert hasattr(_LR_MODEL, "intercept_")
+
+    def test_build_returns_new_instance_each_call(self):
+        """build_lr_model() returns a fresh object each time."""
+        m1 = build_lr_model()
+        m2 = build_lr_model()
+        assert m1 is not m2
+
+    def test_model_coefs_are_reproducible(self):
+        """
+        Two builds should produce identical coefficients because both use
+        np.random.seed(42) internally.
+        """
+        m1 = build_lr_model()
+        m2 = build_lr_model()
+        np.testing.assert_array_almost_equal(m1.coef_, m2.coef_, decimal=6)
+        assert m1.intercept_ == pytest.approx(m2.intercept_, rel=1e-6)
+
+    def test_previous_savings_coef_is_positive(self):
+        """
+        Higher previous savings should raise projected savings — so the
+        coefficient for feature[2] (previous_savings) must be positive.
+        """
+        model = build_lr_model()
+        assert model.coef_[2] > 0
+
+    def test_month_coef_is_positive(self):
+        """
+        Later months should project higher savings due to growth compounding —
+        so the month coefficient must be positive.
+        """
+        model = build_lr_model()
+        assert model.coef_[0] > 0
+
+
+# ===========================================================================
+# Prediction correctness & output quality
+# ===========================================================================
+class TestPredictionCorrectness:
+
+    @pytest.fixture(autouse=True)
+    def base_params(self):
+        self.prev_savings = 30_000   # ₹30k/month
+        self.growth       = 8.0      # 8% annual growth
+        self.years        = 5
+
+    def test_output_length(self):
+        preds = predict_savings_lr(self.prev_savings, self.growth, self.years)
+        assert len(preds) == self.years * 12
+
+    def test_all_values_non_negative(self):
+        preds = predict_savings_lr(self.prev_savings, self.growth, self.years)
+        assert all(v >= 0 for v in preds), "Predictions must be clamped at 0"
+
+    def test_all_values_are_float(self):
+        preds = predict_savings_lr(self.prev_savings, self.growth, self.years)
+        assert all(isinstance(v, float) for v in preds)
+
+    def test_predictions_are_finite(self):
+        preds = predict_savings_lr(self.prev_savings, self.growth, self.years)
+        assert all(np.isfinite(v) for v in preds)
+
+    def test_total_cumulative_is_realistic(self):
+        """
+        With ₹30k/mo baseline, 5-year total should be in the 15L–50L range
+        for 8% growth (accounting for model noise on 300-point training data).
+        """
+        preds = predict_savings_lr(self.prev_savings, self.growth, self.years)
+        total = sum(preds)
+        assert 1_500_000 <= total <= 5_000_000, f"Unexpected cumulative: {total:,.0f}"
+
+    def test_higher_base_savings_yields_higher_total(self):
+        """Larger starting savings → larger projected totals."""
+        low  = sum(predict_savings_lr(10_000, 8.0, 5))
+        high = sum(predict_savings_lr(50_000, 8.0, 5))
+        assert high > low
+
+    def test_higher_growth_rate_yields_higher_total(self):
+        """Higher growth rate → higher projected totals."""
+        conservative = sum(predict_savings_lr(30_000, 2.0,  5))
+        aggressive   = sum(predict_savings_lr(30_000, 20.0, 5))
+        assert aggressive > conservative
+
+    def test_longer_horizon_yields_higher_total(self):
+        """More years → more months → higher cumulative."""
+        short = sum(predict_savings_lr(30_000, 8.0, years=2))
+        long_ = sum(predict_savings_lr(30_000, 8.0, years=5))
+        assert long_ > short
+
+
+# ===========================================================================
+# Feature sensitivity (partial derivative checks)
+# ===========================================================================
+class TestFeatureSensitivity:
+
+    def test_growth_rate_sensitivity(self):
+        """
+        Every 5 percentage-point increase in growth should raise
+        the 5-year cumulative by at least ₹1k (very conservative floor).
+        """
+        total_5  = sum(predict_savings_lr(30_000, 5.0,  5))
+        total_10 = sum(predict_savings_lr(30_000, 10.0, 5))
+        assert total_10 - total_5 > 1_000
+
+    def test_base_savings_sensitivity(self):
+        """
+        Doubling base savings should roughly double the cumulative total
+        (the LR model is linear in previous_savings).
+        """
+        total_base   = sum(predict_savings_lr(20_000, 8.0, 5))
+        total_double = sum(predict_savings_lr(40_000, 8.0, 5))
+        ratio = total_double / total_base if total_base > 0 else 0
+        # Due to intercept and month terms, ratio won't be exactly 2 —
+        # but should be between 1.5 and 2.5 for a reasonable linear model.
+        assert 1.5 <= ratio <= 2.5, f"Sensitivity ratio out of range: {ratio:.2f}"
+
+    def test_zero_growth_vs_positive_growth(self):
+        """Positive growth always beats zero growth."""
+        zero_g = sum(predict_savings_lr(30_000, 0.0, 5))
+        pos_g  = sum(predict_savings_lr(30_000, 8.0, 5))
+        assert pos_g > zero_g
+
+
+# ===========================================================================
+# Statistical model quality on training distribution
+# ===========================================================================
+class TestModelQuality:
+
+    def test_r_squared_on_held_out_data(self):
+        """
+        Re-generate a held-out test set using a different random seed and
+        verify the model's R² is above 0.85 — confirming it learned the
+        underlying data-generating process, not random noise.
+        """
+        model = build_lr_model()
+
+        np.random.seed(99)          # different seed from training (42)
+        n            = 100
+        months_arr   = np.random.randint(1, 61, n).astype(float)
+        growth_rates = np.random.uniform(0, 25, n)
+        prev_savings = np.random.uniform(1000, 100_000, n)
+        noise        = np.random.normal(0, 500, n)
+        targets = (
+            prev_savings * (1 + growth_rates / 100 / 12) ** months_arr
+            + months_arr * 200
+            + noise
+        )
+        X = np.column_stack([months_arr, growth_rates, prev_savings])
+        r2 = model.score(X, targets)
+        assert r2 >= 0.85, f"R² too low on held-out data: {r2:.4f}"
+
+    def test_mean_absolute_error_is_reasonable(self):
+        """
+        MAE on a fresh test set should be below ₹3,000 — an acceptable
+        tolerance for a 300-point LR model trained on synthetic data.
+        """
+        model = build_lr_model()
+        np.random.seed(77)
+        n            = 50
+        months_arr   = np.random.randint(1, 61, n).astype(float)
+        growth_rates = np.random.uniform(0, 25, n)
+        prev_savings = np.random.uniform(1000, 100_000, n)
+        targets = (
+            prev_savings * (1 + growth_rates / 100 / 12) ** months_arr
+            + months_arr * 200
+        )
+        X    = np.column_stack([months_arr, growth_rates, prev_savings])
+        preds = model.predict(X)
+        mae   = np.mean(np.abs(preds - targets))
+        assert mae < 3_000, f"MAE too high: ₹{mae:,.0f}"
+
+    def test_predictions_are_unbiased(self):
+        """
+        Mean residual (predicted − actual) on fresh data should be close to 0,
+        indicating the model has no systematic over- or under-prediction.
+        """
+        model = build_lr_model()
+        np.random.seed(55)
+        n            = 200
+        months_arr   = np.random.randint(1, 61, n).astype(float)
+        growth_rates = np.random.uniform(0, 25, n)
+        prev_savings = np.random.uniform(1000, 100_000, n)
+        targets = (
+            prev_savings * (1 + growth_rates / 100 / 12) ** months_arr
+            + months_arr * 200
+        )
+        X         = np.column_stack([months_arr, growth_rates, prev_savings])
+        preds     = model.predict(X)
+        mean_bias = np.mean(preds - targets)
+        assert abs(mean_bias) < 1_000, f"Model has systematic bias: ₹{mean_bias:,.0f}"
+
+
+# ===========================================================================
+# Numerical stability
+# ===========================================================================
+class TestNumericalStability:
+
+    def test_very_small_base_savings(self):
+        """₹1 starting savings should not cause division errors."""
+        preds = predict_savings_lr(1, 8.0, 2)
+        assert all(np.isfinite(v) for v in preds)
+
+    def test_very_large_base_savings(self):
+        """₹50L starting savings (HNI profile) should be stable."""
+        preds = predict_savings_lr(5_000_000, 8.0, 3)
+        assert all(np.isfinite(v) for v in preds)
+        assert all(v >= 0 for v in preds)
+
+    def test_growth_rate_at_zero(self):
+        preds = predict_savings_lr(30_000, 0.0, 3)
+        assert all(np.isfinite(v) for v in preds)
+
+    def test_growth_rate_at_maximum(self):
+        """25% annual growth (slider max) must not overflow."""
+        preds = predict_savings_lr(30_000, 25.0, 7)
+        assert all(np.isfinite(v) for v in preds)
+
+    def test_one_month_horizon(self):
+        """Minimum meaningful horizon: 1 year."""
+        preds = predict_savings_lr(30_000, 8.0, years=1)
+        assert len(preds) == 12
+        assert all(np.isfinite(v) for v in preds)
+
+    def test_clamping_prevents_negative_output(self):
+        """
+        For very low or zero savings, the raw LR prediction may go negative.
+        The clamp in predict_savings_lr must prevent that.
+        """
+        preds = predict_savings_lr(0, 0.0, years=1)
+        assert all(v >= 0 for v in preds)
+
+
+# ===========================================================================
+# Scenario-based ML validation
+# ===========================================================================
+class TestScenarioValidation:
+
+    def test_optimistic_vs_base_vs_conservative(self):
+        """
+        The three-scenario approach used in the Prediction Engine page:
+        optimistic (+5%) > base > conservative (-5%)
+        """
+        base_savings = 40_000
+        base_growth  = 10.0
+
+        total_optimistic    = sum(predict_savings_lr(base_savings, base_growth + 5, 5))
+        total_base          = sum(predict_savings_lr(base_savings, base_growth,     5))
+        total_conservative  = sum(predict_savings_lr(base_savings, base_growth - 5, 5))
+
+        assert total_optimistic > total_base > total_conservative
+
+    def test_wealth_building_trajectory_is_upward(self):
+        """
+        For a healthy saver (30k base, 8% growth), cumulative wealth should
+        increase from year 1 to year 3 to year 5.
+        """
+        yr1 = sum(predict_savings_lr(30_000, 8.0, years=1))
+        yr3 = sum(predict_savings_lr(30_000, 8.0, years=3))
+        yr5 = sum(predict_savings_lr(30_000, 8.0, years=5))
+
+        assert yr1 < yr3 < yr5
+
+    def test_prediction_consistency_across_calls(self):
+        """
+        The singleton _LR_MODEL must produce identical results on identical
+        inputs — no stochasticity at inference time.
+        """
+        preds_1 = predict_savings_lr(25_000, 10.0, 5)
+        preds_2 = predict_savings_lr(25_000, 10.0, 5)
+        assert preds_1 == preds_2
+
+    def test_monthly_values_generally_increase_with_time(self):
+        """
+        For positive growth, later months should generally project higher
+        savings (with some noise from LR — we check the trend directionally).
+        """
+        preds  = predict_savings_lr(30_000, 8.0, years=5)
+        first_12_avg = np.mean(preds[:12])
+        last_12_avg  = np.mean(preds[-12:])
+        assert last_12_avg > first_12_avg, (
+            f"Last year avg ({last_12_avg:.0f}) ≤ first year avg ({first_12_avg:.0f})"
+        )
+
+    def test_zero_savings_projection_is_minimal(self):
+        """
+        Starting from ₹0 with 0% growth should produce very low cumulative,
+        dominated only by the intercept and month term.
+        """
+        preds = predict_savings_lr(0, 0.0, years=5)
+        total = sum(preds)
+        # The month × 200 term adds ~200 × (1+2+…+60) = 200 × 1830 = 366k max
+        # but clamping may bring some of these to 0
+        assert total >= 0
+        assert total < 5_000_000   # no inflated phantom wealth

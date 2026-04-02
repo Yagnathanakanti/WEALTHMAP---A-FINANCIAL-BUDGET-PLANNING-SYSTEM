@@ -1,0 +1,257 @@
+"""
+tests/test_integration.py
+==========================
+Integration tests that exercise complete, end-to-end financial workflows.
+These tests combine multiple functions to verify that the system behaves
+correctly as a whole — mirroring how a real user interacts with WealthMap.
+"""
+
+import pytest
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import (
+    calculate_savings,
+    emi_ratio,
+    savings_rate,
+    financial_risk_classification,
+    risk_label,
+    goal_feasibility,
+    health_score_weighted,
+    investment_recommendation,
+    predict_savings_lr,
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared fixture profiles
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def junior_employee():
+    """Entry-level professional, moderate savings, some EMI."""
+    return {"salary": 40_000, "expenses": 22_000, "emi": 8_000, "emergency_months": 2}
+
+@pytest.fixture
+def mid_career():
+    """Mid-career professional with home loan and good savings habit."""
+    return {"salary": 120_000, "expenses": 50_000, "emi": 30_000, "emergency_months": 5}
+
+@pytest.fixture
+def high_earner():
+    """Senior professional, high income, well-managed debt."""
+    return {"salary": 250_000, "expenses": 80_000, "emi": 40_000, "emergency_months": 9}
+
+@pytest.fixture
+def financially_stressed():
+    """Over-leveraged profile with minimal savings."""
+    return {"salary": 50_000, "expenses": 28_000, "emi": 26_000, "emergency_months": 0}
+
+
+# ===========================================================================
+# Workflow 1 — Full financial profile evaluation
+# ===========================================================================
+class TestFullProfileEvaluation:
+
+    def test_junior_employee_full_pipeline(self, junior_employee):
+        p = junior_employee
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+        score   = financial_risk_classification(sr, er, p["emergency_months"])
+        label, css = risk_label(score)
+
+        assert savings == 10_000
+        assert sr  == pytest.approx(25.0)
+        assert er  == pytest.approx(20.0)
+        assert label in ("Low", "Medium", "High")
+        assert css in ("risk-low", "risk-medium", "risk-high")
+
+    def test_mid_career_full_pipeline(self, mid_career):
+        p = mid_career
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+        score   = financial_risk_classification(sr, er, p["emergency_months"])
+        label, _ = risk_label(score)
+
+        assert savings == 40_000
+        assert sr  == pytest.approx(33.33, abs=0.1)
+        assert er  == pytest.approx(25.0)
+        assert label == "Low"            # strong profile → low risk
+
+    def test_high_earner_full_pipeline(self, high_earner):
+        p = high_earner
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+        score   = financial_risk_classification(sr, er, p["emergency_months"])
+        label, _ = risk_label(score)
+
+        assert savings == 130_000
+        assert sr > 50            # exceptional saver
+        assert label == "Low"
+
+    def test_stressed_profile_full_pipeline(self, financially_stressed):
+        p = financially_stressed
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+        score   = financial_risk_classification(sr, er, p["emergency_months"])
+        label, _ = risk_label(score)
+
+        assert savings == 0           # over-leveraged, no surplus
+        assert sr  == pytest.approx(0.0)
+        assert er  > 50               # danger zone
+        assert label == "High"        # worst risk classification
+
+
+# ===========================================================================
+# Workflow 2 — Goal planning end-to-end
+# ===========================================================================
+class TestGoalPlanningWorkflow:
+
+    def test_house_down_payment_workflow(self, mid_career):
+        """₹10L down payment in 24 months — feasibility check + projection."""
+        p = mid_career
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+
+        feas, req, gap, sav = goal_feasibility(
+            p["salary"], p["expenses"], p["emi"], 1_000_000, 24
+        )
+
+        assert sav  == savings
+        assert req  == pytest.approx(1_000_000 / 24, abs=1)
+        # 40k/mo × 24 = 9.6L projected vs 10L target → ~96% feasible
+        assert 90 <= feas <= 100
+
+    def test_emergency_fund_goal_workflow(self, junior_employee):
+        """Build 3-month emergency fund (₹90k) in 12 months."""
+        p = junior_employee
+        monthly_need = (p["expenses"] + p["emi"]) * 3  # ₹90k
+        feas, req, gap, sav = goal_feasibility(
+            p["salary"], p["expenses"], p["emi"], monthly_need, 12
+        )
+        assert sav  == 10_000
+        # 10k × 12 = 120k > 90k → over 100% feasible
+        assert feas > 100
+
+    def test_goal_with_partial_savings_already_accumulated(self, mid_career):
+        """
+        If user already saved ₹2L towards a ₹5L goal,
+        remaining target = ₹3L — feasibility should be higher.
+        """
+        p = mid_career
+        target   = 500_000
+        already  = 200_000
+        remaining = target - already
+
+        feas_full, _, _, _ = goal_feasibility(
+            p["salary"], p["expenses"], p["emi"], target, 12
+        )
+        feas_remaining, _, _, _ = goal_feasibility(
+            p["salary"], p["expenses"], p["emi"], remaining, 12
+        )
+
+        assert feas_remaining > feas_full
+
+    def test_impossible_goal_still_returns_valid_numbers(self, financially_stressed):
+        """Even an infeasible profile must return numbers, not raise."""
+        p = financially_stressed
+        feas, req, gap, sav = goal_feasibility(
+            p["salary"], p["expenses"], p["emi"], 5_000_000, 6
+        )
+        assert isinstance(feas, float)
+        assert feas == pytest.approx(0.0)  # no savings → 0 feasibility
+        assert sav  == 0
+
+
+# ===========================================================================
+# Workflow 3 — Risk-to-recommendation pipeline
+# ===========================================================================
+class TestRiskToRecommendationPipeline:
+
+    def _get_recs(self, profile):
+        p       = profile
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+        score   = financial_risk_classification(sr, er, p["emergency_months"])
+        return investment_recommendation(score, sr, er), score
+
+    def test_high_earner_gets_growth_instruments(self, high_earner):
+        recs, score = self._get_recs(high_earner)
+        assert score >= 70
+        names = [r[0] for r in recs]
+        assert any("Equity" in n or "Index" in n for n in names)
+
+    def test_stressed_gets_safe_instruments(self, financially_stressed):
+        recs, score = self._get_recs(financially_stressed)
+        assert score < 40
+        names = [r[0] for r in recs]
+        assert any("FD" in n or "Fixed" in n or "Government" in n for n in names)
+
+    def test_recommendations_always_non_empty(self, junior_employee, mid_career,
+                                               high_earner, financially_stressed):
+        for profile in [junior_employee, mid_career, high_earner, financially_stressed]:
+            recs, _ = self._get_recs(profile)
+            assert len(recs) > 0
+
+
+# ===========================================================================
+# Workflow 4 — Health score end-to-end
+# ===========================================================================
+class TestHealthScoreWorkflow:
+
+    def test_high_earner_health_score_is_excellent(self, high_earner):
+        p = high_earner
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+        score   = health_score_weighted(sr, er, 0.0)
+        assert score >= 70
+
+    def test_stressed_health_score_is_poor(self, financially_stressed):
+        p = financially_stressed
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+        score   = health_score_weighted(sr, er, 0.0)
+        assert score < 40
+
+    def test_health_score_improves_with_better_goal_feasibility(self, mid_career):
+        p = mid_career
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        sr      = savings_rate(savings, p["salary"])
+        er      = emi_ratio(p["emi"], p["salary"])
+
+        score_no_goal   = health_score_weighted(sr, er, 0.0)
+        score_with_goal = health_score_weighted(sr, er, 100.0)
+        assert score_with_goal > score_no_goal
+
+
+# ===========================================================================
+# Workflow 5 — Prediction → cumulative wealth
+# ===========================================================================
+class TestPredictionToWealthWorkflow:
+
+    def test_5yr_projection_cumulative_positive(self, mid_career):
+        p = mid_career
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+        preds   = predict_savings_lr(savings, 8.0, years=5)
+
+        assert len(preds) == 60          # 5 years × 12 months
+        assert sum(preds) > 0
+        total = sum(preds)
+        # 40k/mo × 60 months ≈ 24L baseline; model should be in the same ballpark
+        assert total > 1_000_000         # at least ₹10L over 5 years
+
+    def test_higher_growth_yields_higher_total(self, mid_career):
+        p = mid_career
+        savings = calculate_savings(p["salary"], p["expenses"], p["emi"])
+
+        low_growth  = sum(predict_savings_lr(savings, 3.0,  years=5))
+        high_growth = sum(predict_savings_lr(savings, 20.0, years=5))
+        assert high_growth > low_growth
